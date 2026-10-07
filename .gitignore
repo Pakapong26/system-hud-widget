@@ -1,0 +1,15 @@
+bin/
+obj/
+publish/
+Release/
+*.exe
+*.dll
+*.pdb
+*.bak*
+settings.txt
+history.txt
+errors.log
+.vps_env
+*.key
+*.json
+!**/*.csproj
