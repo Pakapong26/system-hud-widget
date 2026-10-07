@@ -39,6 +39,13 @@ Windows does not expose CPU/GPU temperatures without a driver. Either:
 
 Without either, the HUD still shows load, RAM and the graph.
 
+## Feedback and ideas
+
+Want a feature or found a bug? Tell me either way, all ideas welcome:
+
+- GitHub: [open an issue](https://github.com/Pakapong26/system-hud-widget/issues)
+- X (Twitter): mention or DM [@Pakapong26](https://x.com/Pakapong26)
+
 ## ภาษาไทย
 
 วิดเจ็ตดูสถานะเครื่องสไตล์ไซไฟสำหรับ Windows ทำด้วย **Claude Code**
@@ -48,6 +55,8 @@ Without either, the HUD still shows load, RAM and the graph.
 - เบาเครื่อง อัปเดตวินาทีละครั้ง ไม่ต้องใช้สิทธิ์แอดมิน (ยกเว้นตัวอ่านอุณหภูมิ)
 
 ติดตั้ง: ลง .NET 8 SDK แล้วรัน `dotnet publish -c Release -o publish` คลิกขวาที่วิดเจ็ตเพื่อตั้งค่า
+
+**อยากได้ฟีเจอร์อะไรหรือเจอบั๊ก** บอกได้ทั้ง [เปิด issue บน GitHub](https://github.com/Pakapong26/system-hud-widget/issues) หรือแท็ก / DM มาที่ X [@Pakapong26](https://x.com/Pakapong26) ยินดีรับทุกไอเดียครับ
 
 ## License
 
