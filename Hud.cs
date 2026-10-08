@@ -20,22 +20,62 @@ sealed class HudForm : Form
         ("Arctic Ice", Color.FromArgb(186, 230, 253), Color.FromArgb(224, 231, 255)),
         ("Crimson", Color.FromArgb(248, 113, 113), Color.FromArgb(253, 164, 175)),
         ("Toxic Lime", Color.FromArgb(163, 230, 53), Color.FromArgb(45, 212, 191)),
+        ("Royal Violet", Color.FromArgb(192, 132, 252), Color.FromArgb(244, 114, 182)),   // same 8 names as AI Quota HUD, so group mode can share them
     };
     static readonly string[] Backgrounds = { "Glass (dark)", "Glass (tinted)", "Solid black", "None (floating)" };
-    static readonly Color Amber = Color.FromArgb(251, 191, 36), Red = Color.FromArgb(248, 113, 113), Ink = Color.FromArgb(232, 246, 255), Dim = Color.FromArgb(125, 150, 172);
+    // Warning colours do not follow the theme (same tokens as ai-quota-hud), so "hot" reads the same in every theme;
+    // a symbol goes with them, so nothing depends on colour alone.
+    static readonly Color Amber = Color.FromArgb(241, 181, 76), Red = Color.FromArgb(255, 140, 135), Ink = Color.FromArgb(232, 246, 255), Dim = Color.FromArgb(125, 150, 172);
 
     // ---- settings ----
     int theme = 0, bg = 0, panelAlpha = 210;   // panel alpha 0..255 (background only)
     byte opacity = 255;                         // the whole widget
     float size = 1f;                            // 0.75 .. 1.5
-    bool fahrenheit, showThreads = true, showGraph = true, showClock = true, corners = true, pinDesktop;
+    bool fahrenheit, showThreads = true, showGraph = true, showClock = true, corners = true, pinDesktop, showNet = true;
+    Point savedLoc;
+    int frame;                                              // 0 full rim + brackets, 1 faint rim, 2 no frame
+    int quotaSide;                                          // linked: 1 = AI Quota HUD sits under this one, -1 = above, 0 = apart
     bool resizing; Point resizeStart; float resizeSize0;
 
     readonly Sensors s = new();
+    readonly NetDisk nd = new();
+    RectangleF diskRect, diskNameRect, diskValueRect;       // where the disk text sits in the strip (hover list, clicks)
+    RectangleF powerRect; readonly List<RectangleF> tempRects = new();   // clickable: PKG/SYS power line, the two temperatures
+    bool sysPower;                                          // power line shows the whole PC (battery discharge) instead of CPU package
+    bool Narrow => size < 0.8f;
+    string diskSel = ""; bool diskUsedMode;                  // shown drive (empty = the fullest / system drive) and "used of total" instead of "free"
+    bool allDisks = true;                                   // false: system drive only
     readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
     readonly System.Windows.Forms.Timer anim = new() { Interval = 40 };      // ~25 fps, only while a value is still gliding
     float dCpu, dGpu, dRam; float[] dThr;
-    readonly Font fTitle = new("Bahnschrift SemiCondensed", 8.5f, FontStyle.Regular, GraphicsUnit.Point), fBig = new("Bahnschrift", 20f, FontStyle.Bold, GraphicsUnit.Point), fSmall = new("Bahnschrift SemiCondensed", 8f, FontStyle.Regular, GraphicsUnit.Point);                                       // the values on screen, eased toward the sensors
+    // Font presets, all Windows system fonts; the menu lists only the ones installed. Same set as ai-quota-hud.
+    // bold = big numbers, text = labels, k = size factor for wide faces.
+    static readonly (string key, string label, string bold, string text, float k)[] FontSets =
+    {
+        ("bahn", "Bahnschrift  (sci-fi HUD)", "Bahnschrift SemiBold", "Bahnschrift SemiCondensed", 1f),
+        ("segoe", "Segoe UI  (GitHub style)", "Segoe UI Semibold", "Segoe UI", 0.94f),
+        ("variable", "Segoe UI Variable  (Windows 11)", "Segoe UI Variable Display Semib", "Segoe UI Variable Small", 0.94f),
+        ("cascadia", "Cascadia Mono  (terminal)", "Cascadia Mono SemiBold", "Cascadia Mono", 0.85f),
+        ("consolas", "Consolas  (code)", "Consolas", "Consolas", 0.9f),
+        ("arial", "Arial  (classic)", "Arial", "Arial", 0.92f),
+        ("verdana", "Verdana  (large, easy to read)", "Verdana", "Verdana", 0.8f),
+        ("inter", "Inter  (if installed)", "Inter SemiBold", "Inter", 0.9f),
+    };
+    static readonly HashSet<string> Installed = new(new System.Drawing.Text.InstalledFontCollection().Families.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
+    static bool HasSet((string key, string label, string bold, string text, float k) s) => Installed.Contains(s.bold) && Installed.Contains(s.text);
+    string fontKey = "bahn";
+    Font fTitle, fBig, fSmall;
+    // below ~80 % the labels are drawn larger than the shrink would make them, so they stay readable on a small widget
+    float TextBoost => Math.Clamp(0.8f / size, 1f, 1.2f);
+    void BuildFonts()
+    {
+        var s = FontSets.FirstOrDefault(f => f.key == fontKey && HasSet(f));
+        if (s.key == null) { s = FontSets[0]; fontKey = s.key; }
+        Font Make(string fam, float pt, bool strong) => new(fam, pt * s.k, strong && fam == s.text ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+        foreach (var f in new[] { fTitle, fBig, fSmall }) f?.Dispose();
+        float b = TextBoost;
+        fTitle = Make(s.text, 8.5f * b, false); fBig = Make(s.bold, 18f, true); fSmall = Make(s.text, 8f * b, false);
+    }
     readonly Queue<float> cpuHist = new(), gpuHist = new();
     float scale = 1f;
     readonly string cfgPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HudWidget", "settings.txt");
@@ -43,38 +83,50 @@ sealed class HudForm : Form
     Color A1 => Themes[theme].a1;
     Color A2 => Themes[theme].a2;
     int W => showThreads ? 380 : 256;
-    int H => showGraph ? 214 : 172;
+    int H => (showGraph ? 214 : 172) + (showNet ? 22 : 0);
 
     public HudForm()
     {
         FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; StartPosition = FormStartPosition.Manual;
+        base.Text = WidgetDock.HudTitle;                          // AI Quota HUD finds this window by its title to dock with it
         LoadSettings();
+        BuildFonts();
         ApplySize();
         if (Location == Point.Empty) { var wa = Screen.PrimaryScreen.WorkingArea; Location = new Point(wa.Right - Width - 24, wa.Top + 24); }
         ContextMenuStrip = BuildMenu();
         MouseDown += (_, e) =>
         {
             if (e.Button != MouseButtons.Left) return;
+            if (DiskClick(e.Location)) return;              // click the drive name / number in the bottom strip
+            var lp = new PointF(e.X / scale, e.Y / scale);
+            if (showThreads && powerRect.Contains(lp)) { sysPower = !sysPower; SaveSettings(); Render(); return; }       // PKG <-> SYS
+            if (tempRects.Any(r => r.Contains(lp))) { fahrenheit = !fahrenheit; SaveSettings(); Render(); return; }     // °C <-> °F
             if (InGrip(e.Location)) { resizing = true; resizeStart = Cursor.Position; resizeSize0 = size; Capture = true; return; }   // drag the bottom-right corner to resize
             ReleaseCapture(); SendMessage(Handle, 0xA1, 2, 0); SaveSettings();
         };
         MouseMove += (_, e) =>
         {
-            if (resizing) { size = Math.Clamp(resizeSize0 + (Cursor.Position.X - resizeStart.X) / (W * DeviceDpi / 96f), 0.6f, 2.2f); ApplySize(); Render(); }
-            else Cursor = InGrip(e.Location) ? Cursors.SizeNWSE : Cursors.Default;
+            if (resizing) { size = Math.Clamp(resizeSize0 + (Cursor.Position.X - resizeStart.X) / (W * DeviceDpi / 96f), 0.6f, 2.2f); ApplySize(); BuildFonts(); Render(); }
+            else { Cursor = InGrip(e.Location) ? Cursors.SizeNWSE : Cursors.Default; DiskHover(e.Location); }
         };
+        MouseLeave += (_, _) => { if (Bounds.Contains(Cursor.Position)) return; diskTip.Hide(this); diskTipShown = false; };   // moving onto our own tip is not leaving
         MouseUp += (_, _) => { if (resizing) { resizing = false; Capture = false; SaveSettings(); } };
-        MouseWheel += (_, e) => { if ((ModifierKeys & Keys.Control) != 0) { size = Math.Clamp(size + (e.Delta > 0 ? 0.05f : -0.05f), 0.6f, 2.2f); ApplySize(); SaveSettings(); Render(); } };   // Ctrl+wheel resizes
+        MouseWheel += (_, e) => { if ((ModifierKeys & Keys.Control) != 0) { size = Math.Clamp(size + (e.Delta > 0 ? 0.05f : -0.05f), 0.6f, 2.2f); ApplySize(); BuildFonts(); SaveSettings(); Render(); } };   // Ctrl+wheel resizes
         dThr = new float[s.Threads];
         timer.Tick += (_, _) =>
         {
             timer.Interval = Math.Max(200, 1000 - DateTime.Now.Millisecond + 15);  // tick just after each real second, so the clock never skips
-            s.Update(); Push(cpuHist, s.CpuLoad); Push(gpuHist, Math.Max(0, s.GpuLoad));
+            s.Update(); nd.Update(); Push(cpuHist, s.CpuLoad); Push(gpuHist, Math.Max(0, s.GpuLoad));
+            ApplyGroup();                                    // colours / size changed on the AI Quota HUD side
+            quotaSide = 0;
+            if (link && WidgetDock.RectOf(WidgetDock.QuotaTitle) is Rectangle qr && qr.Right > Left && qr.Left < Right)
+                quotaSide = Math.Abs(qr.Top - Bottom) < 24 ? 1 : Math.Abs(qr.Bottom - Top) < 24 ? -1 : 0;
+            if (Location != savedLoc) SaveSettings();       // also catches a move made by the docked AI Quota HUD
             if (!anim.Enabled) anim.Start();
             Render();
         };
         anim.Tick += (_, _) => { if (!Step()) anim.Stop(); Render(); };
-        Shown += (_, _) => { ApplyPin(); s.Update(); Render(); timer.Start(); };
+        Shown += (_, _) => { ApplyGroup(); ApplyPin(); s.Update(); Render(); timer.Start(); };
         FormClosed += (_, _) => { SaveSettings(); timer.Dispose(); anim.Dispose(); s.Dispose(); };
     }
 
@@ -93,6 +145,7 @@ sealed class HudForm : Form
     }
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == 0x0216) WidgetDock.OnMoving(Handle, WidgetDock.QuotaTitle, link, m.LParam);   // WM_MOVING: snap to / drag the other widget
         if (pinDesktop && m.Msg == 0x46)   // WM_WINDOWPOSCHANGING: stay under every other window
         {
             var wp = Marshal.PtrToStructure<WINDOWPOS>(m.LParam);
@@ -122,6 +175,8 @@ sealed class HudForm : Form
             mBg.DropDownItems.Add(Radio(label, () => panelAlpha == a, () => panelAlpha = a));
         mBg.DropDownItems.Add(new ToolStripSeparator());
         mBg.DropDownItems.Add(Check("HUD corner brackets", () => corners, v => corners = v));
+        mBg.DropDownItems.Add(new ToolStripSeparator());
+        foreach (var (label, k) in new[] { ("Frame: full", 0), ("Frame: subtle", 1), ("Frame: none", 2) }) mBg.DropDownItems.Add(Radio(label, () => frame == k, () => frame = k));
 
         var mOp = new ToolStripMenuItem("Whole widget opacity");
         foreach (var (label, a) in new[] { ("100%", (byte)255), ("85%", (byte)217), ("70%", (byte)178), ("55%", (byte)140), ("40%", (byte)102) })
@@ -129,12 +184,17 @@ sealed class HudForm : Form
 
         var mSize = new ToolStripMenuItem("Size  (or Ctrl+wheel / drag corner)");
         foreach (var (label, f) in new[] { ("60%", 0.6f), ("75%", 0.75f), ("90%", 0.9f), ("100%", 1f), ("120%", 1.2f), ("150%", 1.5f), ("180%", 1.8f), ("220%", 2.2f) })
-            mSize.DropDownItems.Add(Radio(label, () => Math.Abs(size - f) < 0.01f, () => { size = f; ApplySize(); }));
+            mSize.DropDownItems.Add(Radio(label, () => Math.Abs(size - f) < 0.01f, () => { size = f; ApplySize(); BuildFonts(); }));
 
         var mShow = new ToolStripMenuItem("Show");
         mShow.DropDownItems.Add(Check("Threads + memory", () => showThreads, v => { showThreads = v; ApplySize(); }));
         mShow.DropDownItems.Add(Check("60 s history graph", () => showGraph, v => { showGraph = v; ApplySize(); }));
         mShow.DropDownItems.Add(Check("Clock", () => showClock, v => showClock = v));
+        mShow.DropDownItems.Add(Check("Network, ping + disk", () => showNet, v => { showNet = v; ApplySize(); }));
+        mShow.DropDownItems.Add(Check("All drives  (off = system drive only)", () => allDisks, v => allDisks = v));
+
+        var mFont = new ToolStripMenuItem("Font");
+        foreach (var fs in FontSets.Where(HasSet)) { var k = fs.key; mFont.DropDownItems.Add(Radio(fs.label, () => fontKey == k, () => { fontKey = k; BuildFonts(); })); }
 
         var mUnit = new ToolStripMenuItem("Temperature unit");
         mUnit.DropDownItems.Add(Radio("°C", () => !fahrenheit, () => fahrenheit = false));
@@ -142,6 +202,7 @@ sealed class HudForm : Form
 
         var miTop = Check("Always on top", () => TopMost && !pinDesktop, v => { pinDesktop = false; ApplyPin(); TopMost = v; });
         var miPin = Check("Pin to desktop (like Rainmeter)", () => pinDesktop, v => { pinDesktop = v; ApplyPin(); });
+        var miDock = GroupMenu();
         var miStart = new ToolStripMenuItem("Start with Windows") { Checked = IsStartup() };
         miStart.Click += (_, _) => { ToggleStartup(); miStart.Checked = IsStartup(); };
         var miLhm = new ToolStripMenuItem("Temperature source: " + (s.LhmOnline ? "LibreHardwareMonitor" : "not running"));
@@ -149,8 +210,8 @@ sealed class HudForm : Form
         miLhm.Enabled = false;
 
         m.Opening += (_, _) => RefreshChecks();
-        foreach (var sub in new[] { mTheme, mBg, mOp, mSize, mShow, mUnit }) sub.DropDownOpening += (_, _) => RefreshChecks();
-        m.Items.AddRange(new ToolStripItem[] { mTheme, mBg, mOp, mSize, mShow, mUnit, new ToolStripSeparator(), miPin, miTop, miStart, new ToolStripSeparator(), miLhm,
+        foreach (var sub in new[] { mTheme, mBg, mOp, mSize, mShow, mUnit, mFont }) sub.DropDownOpening += (_, _) => RefreshChecks();
+        m.Items.AddRange(new ToolStripItem[] { mTheme, mFont, mBg, mOp, mSize, mShow, mUnit, new ToolStripSeparator(), miPin, miTop, miDock, miStart, new ToolStripSeparator(), miLhm,
             new ToolStripSeparator(), new ToolStripMenuItem("Exit", null, (_, _) => Close()) });
         return m;
     }
@@ -199,14 +260,14 @@ sealed class HudForm : Form
     // ---------------- drawing ----------------
     static void Push(Queue<float> q, float v) { q.Enqueue(v); while (q.Count > 60) q.Dequeue(); }
     static Color Heat(float t, Color cool) => float.IsNaN(t) ? cool : t >= 90 ? Red : t >= 75 ? Amber : cool;
-    string Temp(float c) => float.IsNaN(c) ? (fahrenheit ? "--- °F" : "--.- °C") : fahrenheit ? $"{c * 9 / 5 + 32:0} °F" : $"{c:0.0} °C";
+    string Temp(float c) => float.IsNaN(c) ? (fahrenheit ? "--- °F" : "--.- °C") : (c >= 90 ? "⚠ " : "") + (fahrenheit ? $"{c * 9 / 5 + 32:0} °F" : $"{c:0.0} °C");
 
     public static void Snapshot(string file, string opts)
     {
         using var f = new HudForm();
         if (!string.IsNullOrEmpty(opts)) f.ApplyOpts(opts);
-        f.ApplySize();
-        for (int i = 0; i < 4; i++) { f.s.Update(); Push(f.cpuHist, f.s.CpuLoad); Push(f.gpuHist, Math.Max(0, f.s.GpuLoad)); Thread.Sleep(1000); }
+        f.BuildFonts(); f.ApplySize();
+        for (int i = 0; i < 4; i++) { f.s.Update(); f.nd.Update(); Push(f.cpuHist, f.s.CpuLoad); Push(f.gpuHist, Math.Max(0, f.s.GpuLoad)); Thread.Sleep(1000); }
         for (int i = 0; i < 30; i++) Push(f.cpuHist, 20 + 15 * (float)Math.Sin(i / 3.0) + f.s.CpuLoad / 3);
         f.dThr ??= new float[f.s.Threads]; while (f.Step()) { }
         using var bmp = new Bitmap(f.Width, f.Height, PixelFormat.Format32bppArgb);
@@ -223,7 +284,7 @@ sealed class HudForm : Form
     void ApplyOpts(string o)   // e.g. "theme=2;bg=0;alpha=128" (snapshots only)
     {
         foreach (var kv in o.Split(';').Select(x => x.Split('=')).Where(x => x.Length == 2))
-            switch (kv[0]) { case "theme": theme = int.Parse(kv[1]); break; case "bg": bg = int.Parse(kv[1]); break; case "alpha": panelAlpha = int.Parse(kv[1]); break; case "threads": showThreads = kv[1] == "1"; break; case "graph": showGraph = kv[1] == "1"; break; case "size": size = float.Parse(kv[1], System.Globalization.CultureInfo.InvariantCulture); break; }
+            switch (kv[0]) { case "theme": theme = int.Parse(kv[1]); break; case "bg": bg = int.Parse(kv[1]); break; case "alpha": panelAlpha = int.Parse(kv[1]); break; case "threads": showThreads = kv[1] == "1"; break; case "graph": showGraph = kv[1] == "1"; break; case "size": size = float.Parse(kv[1], System.Globalization.CultureInfo.InvariantCulture); break; case "font": fontKey = kv[1]; break; case "net": showNet = kv[1] == "1"; break; case "frame": frame = int.Parse(kv[1]); break; }
     }
 
     void Render()
@@ -257,9 +318,9 @@ sealed class HudForm : Form
             }
             else if (bg == 2) { using var fill = new SolidBrush(Color.FromArgb(panelAlpha, 0, 0, 0)); g.FillPath(fill, path); }
             else { using var catchAll = new SolidBrush(Color.FromArgb(1, 0, 0, 0)); g.FillPath(catchAll, path); }   // nearly invisible, still catches the mouse
-            if (bg != 3) { using var rim = new LinearGradientBrush(r, Color.FromArgb(150, A1), Color.FromArgb(120, A2), 0f); using var pen = new Pen(rim, 1f); g.DrawPath(pen, path); }
+            if (bg != 3) { using var rim = new LinearGradientBrush(r, Color.FromArgb(frame == 0 ? 150 : 40, A1), Color.FromArgb(frame == 0 ? 120 : 30, A2), 0f); using var pen = new Pen(rim, 1f); if (frame < 2) g.DrawPath(pen, path); }
         }
-        if (corners)
+        if (corners && frame == 0)
         {
             using var br = new Pen(Color.FromArgb(220, A1), 1.6f); float L = 12;
             g.DrawLines(br, new[] { new PointF(6, 6 + L), new PointF(6, 6), new PointF(6 + L, 6) });
@@ -271,31 +332,45 @@ sealed class HudForm : Form
         using var ink = new SolidBrush(Ink); using var dim = new SolidBrush(Dim);
         bool floating = bg == 3;
 
-        Text(g, "SYSTEM  //  " + (Environment.GetEnvironmentVariable("HUD_LABEL") ?? Environment.MachineName).ToUpperInvariant(), fTitle, dim, 22, 10, floating);
-        if (showClock) { var clock = DateTime.Now.ToString("HH:mm:ss"); using var cb0 = new SolidBrush(Color.FromArgb(210, A1)); Text(g, clock, fTitle, cb0, w - 22 - g.MeasureString(clock, fTitle).Width, 10, floating); }
+        // linked as one panel: the top widget shows one clock with the date, the lower one none
+        var clockTxt = !showClock || quotaSide == -1 ? "" : quotaSide == 1 ? DateTime.Now.ToString("ddd dd MMM  HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture) : DateTime.Now.ToString("HH:mm:ss");
+        float clockW = clockTxt.Length > 0 ? g.MeasureString(clockTxt, fTitle).Width : 0;
+        var title = "SYSTEM  //  " + (Environment.GetEnvironmentVariable("HUD_LABEL") ?? Environment.MachineName).ToUpperInvariant();
+        while (title.Length > 10 && 22 + g.MeasureString(title, fTitle).Width > w - 26 - clockW) title = title[..^2] + "…";   // shorten the label, never overlap the clock
+        Text(g, title, fTitle, dim, 22, 10, floating);
+        if (clockTxt.Length > 0) { using var cb0 = new SolidBrush(Color.FromArgb(210, A1)); Text(g, clockTxt, fTitle, cb0, w - 22 - clockW, 10, floating); }
 
+        tempRects.Clear(); powerRect = RectangleF.Empty;
         Ring(g, new RectangleF(20, 34, 104, 104), dCpu, Heat(s.CpuTemp, A1), "CPU", fBig, fSmall, ink, dim, Temp(s.CpuTemp), $"{s.CpuGhz:0.00} GHz", floating);
         Ring(g, new RectangleF(136, 34, 104, 104), s.GpuLoad < 0 ? 0 : dGpu, Heat(s.GpuTemp, A2), "GPU", fBig, fSmall, ink, dim, Temp(s.GpuTemp), s.GpuLoad < 0 ? "n/a" : "3D load", floating);
 
         if (showThreads)
         {
-            float x0 = 254, y0 = 42, span = 118f, gap = s.Threads > 24 ? 1f : 1.6f, bw = (span - gap * (s.Threads - 1)) / s.Threads, bh = 50;   // the bars fit any thread count
-            Text(g, $"THREADS  ×{s.Threads}", fSmall, dim, x0 - 2, 24, floating);
+            // the label goes under the clock line and the bars under the label, whatever the font size
+            float labelY = 10 + g.MeasureString("0", fTitle).Height - 3, labelH = g.MeasureString("T", fSmall).Height;
+            float x0 = 254, y0 = Math.Max(42, labelY + labelH - 2), span = 118f, gap = s.Threads > 24 ? 1f : 1.6f, bw = (span - gap * (s.Threads - 1)) / s.Threads, bh = 92 - y0;   // the bars fit any thread count
+            Text(g, $"THREADS  ×{s.Threads}", fSmall, dim, x0 - 2, labelY, floating);
             for (int i = 0; i < s.Threads; i++)
             {
                 float x = x0 + i * (bw + gap);
                 using var track = new SolidBrush(Color.FromArgb(40, A1)); g.FillRectangle(track, x, y0, bw, bh);
-                float v = dThr[i] / 100f * bh; var c = dThr[i] >= 90 ? Amber : A1;
+                float v = dThr[i] / 100f * bh; var c = dThr[i] >= 98 ? Red : dThr[i] >= 90 ? Amber : A1;
                 using var lb = new LinearGradientBrush(new RectangleF(x, y0, bw, bh + 1), Color.FromArgb(245, c), Color.FromArgb(90, c), 90f);
                 g.FillRectangle(lb, x, y0 + bh - v, bw, v);
             }
             float ry = 118, rw = span, ramPct = float.IsFinite(dRam) ? Math.Clamp(dRam / 100f, 0, 1) : 0;
-            Text(g, "RAM", fSmall, dim, x0 - 2, ry - 16, floating);
-            var ramTxt = $"{s.RamUsedGb:0.0}/{s.RamTotalGb:0.0} GB";
-            Text(g, ramTxt, fSmall, ink, x0 + rw - g.MeasureString(ramTxt, fSmall).Width + 2, ry - 16, floating);
+            float ly = ry - g.MeasureString("R", fSmall).Height - 1;                          // label line sits just above the bar at any font size
+            var ramTxt = (ramPct > 0.9 ? "⚠ " : "") + $"{s.RamUsedGb:0.0}/{s.RamTotalGb:0.0} GB";
+            if (g.MeasureString("RAM ", fSmall).Width + g.MeasureString(ramTxt, fSmall).Width > rw) ramTxt = (ramPct > 0.9 ? "⚠ " : "") + $"{s.RamUsedGb:0.0}/{s.RamTotalGb:0}G";
+            Text(g, "RAM", fSmall, dim, x0 - 2, ly, floating);
+            Text(g, ramTxt, fSmall, ink, x0 + rw - g.MeasureString(ramTxt, fSmall).Width + 2, ly, floating);
             using (var track = new SolidBrush(Color.FromArgb(40, A2))) g.FillRectangle(track, x0, ry, rw, 6);
-            using (var rb = new LinearGradientBrush(new RectangleF(x0, ry, rw, 6), A2, ramPct > 0.9 ? Red : A1, 0f)) g.FillRectangle(rb, x0, ry, Math.Max(0.1f, rw * ramPct), 6);
-            if (!float.IsNaN(s.CpuPower)) Text(g, $"PKG {s.CpuPower:0.0} W", fSmall, dim, x0 - 2, ry + 10, floating);
+            using (var rb = new LinearGradientBrush(new RectangleF(x0, ry, rw, 6), A2, ramPct > 0.9 ? Red : ramPct > 0.8 ? Amber : A1, 0f)) g.FillRectangle(rb, x0, ry, Math.Max(0.1f, rw * ramPct), 6);
+            // click to switch: PKG = CPU package power (on APUs it includes the built-in GPU) / SYS = whole PC, read from the
+            // battery's discharge rate, so only while unplugged
+            var pw = sysPower ? (double.IsNaN(nd.SysPowerW) ? (nd.OnAc ? "SYS  on AC" : "SYS  —") : $"SYS {nd.SysPowerW:0.0} W") : float.IsNaN(s.CpuPower) ? "PKG —" : $"PKG {s.CpuPower:0.0} W";
+            Text(g, pw, fSmall, dim, x0 - 2, ry + 10, floating);
+            powerRect = new RectangleF(x0 - 2, ry + 8, g.MeasureString(pw, fSmall).Width, 16);
         }
 
         string src = s.LhmOnline ? "TEMP · " + s.Source : "TEMP · start SensorBridge";
@@ -308,8 +383,87 @@ sealed class HudForm : Form
             Text(g, "LOAD · 60 s", fSmall, dim, hr.Left, hr.Bottom + 2, floating);
             Text(g, src, fSmall, srcBr, hr.Right - g.MeasureString(src, fSmall).Width, hr.Bottom + 2, floating);
         }
-        else Text(g, src, fSmall, srcBr, w - 20 - g.MeasureString(src, fSmall).Width, h - 20, floating);
-        using (var grip = new Pen(Color.FromArgb(110, A1), 1f)) { g.DrawLine(grip, w - 5, h - 12, w - 12, h - 5); g.DrawLine(grip, w - 5, h - 8, w - 8, h - 5); }
+        else Text(g, src, fSmall, srcBr, w - 20 - g.MeasureString(src, fSmall).Width, h - 20 - (showNet ? 22 : 0), floating);
+        if (showNet) NetStrip(g, w, (showGraph ? 214 : 172) - 8, ink, dim, floating);
+        if (frame < 2) using (var grip = new Pen(Color.FromArgb(frame == 0 ? 110 : 45, A1), 1f)) { g.DrawLine(grip, w - 5, h - 12, w - 12, h - 5); g.DrawLine(grip, w - 5, h - 8, w - 8, h - 5); }
+    }
+
+    // ↓ / ↑ speed · ping · system-drive space; amber/red with ⚠ when the ping is slow or the disk nearly full
+    void NetStrip(Graphics g, int w, float y, Brush ink, Brush dim, bool sh)
+    {
+        using (var ln = new Pen(Color.FromArgb(28, Ink), 1f)) g.DrawLine(ln, 20, y, w - 20, y);
+        y += 4;
+        float x = 20;
+        void Part(string label, string value, Color? warn)
+        {
+            Text(g, label, fSmall, dim, x, y, sh); x += g.MeasureString(label, fSmall).Width - 2;
+            using var vb = new SolidBrush(warn ?? Ink); Text(g, value, fSmall, vb, x, y, sh); x += g.MeasureString(value, fSmall).Width + 2;
+        }
+        Part("↓", NetDisk.Rate(nd.DownBps), null);
+        Part("↑", NetDisk.Rate(nd.UpBps), null);
+        Color? pc = nd.PingMs < 0 ? Red : nd.PingMs >= 150 ? Amber : null;
+        Part("PING", nd.PingMs < 0 ? "⚠ —" : (nd.PingMs >= 150 ? "⚠ " : "") + $"{nd.PingMs} ms", pc);
+        // one drive at a time: click its name to go to the next drive, click the number to switch "free" / "used of total";
+        // "+N" says more drives exist (hover lists them all). With "All drives" off only the system drive is shown.
+        diskRect = diskNameRect = diskValueRect = RectangleF.Empty;
+        var disks = allDisks ? nd.Disks : nd.Disks.Take(1).ToList();
+        if (disks.Count == 0) return;
+        var d = disks.FirstOrDefault(q => q.Name == diskSel) ?? disks.FirstOrDefault(q => q.Used >= 0.9) ?? disks[0];
+        var dc = d.Used >= 0.9 ? Red : d.Used >= 0.8 ? Amber : A1;
+        var nameTxt = (d.Used >= 0.9 ? "⚠ " : "") + d.Name;
+        string more = disks.Count > 1 ? $"+{disks.Count - 1}" : "";
+        var forms = diskUsedMode
+            ? new[] { ($"{d.TotalGb - d.FreeGb:0} / {d.TotalGb:0} GB", 30f), ($"{d.TotalGb - d.FreeGb:0} / {d.TotalGb:0} GB", 0f), ($"{d.TotalGb - d.FreeGb:0}/{d.TotalGb:0}G", 0f) }
+            : new[] { ($"{d.FreeGb:0} GB free", 30f), ($"{d.FreeGb:0} GB free", 0f), ($"{d.FreeGb:0}G", 0f) };
+        float nameW = g.MeasureString(nameTxt, fSmall).Width, moreW = more.Length > 0 ? g.MeasureString(more, fSmall).Width + 2 : 0;
+        foreach (var (val, bw) in forms)
+        {
+            float valW = g.MeasureString(val, fSmall).Width;
+            float right = w - 20 - moreW, vx = right - valW, bx = vx - (bw > 0 ? bw + 4 : 0), nx = bx - nameW + 2;
+            if (nx < x - 4 && val != forms[^1].Item1) continue;
+            using (var nb = new SolidBrush(d.Used >= 0.8 ? dc : Ink)) Text(g, nameTxt, fSmall, nb, nx, y, sh);
+            if (bw > 0)
+            {
+                using (var tr = new SolidBrush(Color.FromArgb(40, dc))) g.FillRectangle(tr, bx, y + 5, bw, 5);
+                using (var fb = new SolidBrush(dc)) g.FillRectangle(fb, bx, y + 5, (float)(bw * d.Used), 5);
+            }
+            using (var vb = new SolidBrush(d.Used >= 0.8 ? dc : Ink)) Text(g, val, fSmall, vb, vx, y, sh);
+            if (more.Length > 0) { using var mb = new SolidBrush(Dim); Text(g, more, fSmall, mb, right + 2, y, sh); }
+            diskNameRect = new RectangleF(nx - 2, y - 2, nameW + 2, 16);
+            diskValueRect = new RectangleF(bx, y - 2, w - 20 - bx, 16);
+            diskRect = RectangleF.Union(diskNameRect, diskValueRect);
+            break;
+        }
+    }
+
+    // clicks on the disk part of the strip: true when handled (then no drag starts)
+    bool DiskClick(Point p)
+    {
+        var q = new PointF(p.X / scale, p.Y / scale);
+        if (!showNet || diskRect.IsEmpty || !diskRect.Contains(q)) return false;
+        if (diskNameRect.Contains(q) && allDisks && nd.Disks.Count > 1)
+        {
+            var cur = nd.Disks.FirstOrDefault(d => d.Name == diskSel) ?? nd.Disks.FirstOrDefault(d => d.Used >= 0.9) ?? nd.Disks[0];
+            diskSel = nd.Disks[(nd.Disks.IndexOf(cur) + 1) % nd.Disks.Count].Name;
+        }
+        else diskUsedMode = !diskUsedMode;
+        diskTip.Hide(this); diskTipShown = false;
+        SaveSettings(); Render();
+        return true;
+    }
+
+    // hovering the disk part of the strip lists every drive
+    readonly ToolTip diskTip = new() { InitialDelay = 150, ShowAlways = true };
+    bool diskTipShown;
+    void DiskHover(Point p)
+    {
+        bool over = showNet && !diskRect.IsEmpty && diskRect.Contains(p.X / scale, p.Y / scale);
+        if (over == diskTipShown) return;
+        diskTipShown = over;
+        if (!over) { diskTip.Hide(this); return; }
+        var lines = nd.Disks.Select(d => $"{(d.Used >= 0.9 ? "⚠ " : "")}{d.Name}  {d.FreeGb:0} GB free of {d.TotalGb:0} GB  ({d.Used * 100:0}% used)");
+        // below-right of the pointer: a tip that covers the pointer makes the widget lose the mouse and the tip blink
+        diskTip.Show(string.Join("\n", lines), this, p.X + 16, p.Y + 22);
     }
 
     static void Text(Graphics g, string t, Font f, Brush b, float x, float y, bool shadow)
@@ -334,11 +488,12 @@ sealed class HudForm : Form
         using (var arc = new Pen(c, 7f) { StartCap = LineCap.Round, EndCap = LineCap.Round }) g.DrawArc(arc, r, start, sw);
         var pctTxt = $"{pct:0}";
         var ps = g.MeasureString(pctTxt, fBig); float mx = r.X + r.Width / 2, my = r.Y + r.Height / 2;
-        Text(g, pctTxt, fBig, ink, mx - ps.Width / 2 - 4, my - ps.Height / 2 - 8, shadow);
-        Text(g, "%", fSmall, dim, mx + ps.Width / 2 - 8, my - 10, shadow);
+        Text(g, pctTxt, fBig, ink, mx - ps.Width / 2 - 4, my - ps.Height / 2 - 4, shadow);
+        Text(g, "%", fSmall, dim, mx + ps.Width / 2 - 8, my - 6, shadow);
         using var cb = new SolidBrush(c);
-        var ls = g.MeasureString(label, fSmall); Text(g, label, fSmall, cb, mx - ls.Width / 2, r.Y + 18, shadow);
-        var ts = g.MeasureString(temp, fSmall); Text(g, temp, fSmall, ink, mx - ts.Width / 2, my + 12, shadow);
+        var ls = g.MeasureString(label, fSmall); Text(g, label, fSmall, cb, mx - ls.Width / 2, my - ps.Height / 2 - 4 - ls.Height + 6, shadow);
+        var ts = g.MeasureString(temp, fSmall); Text(g, temp, fSmall, ink, mx - ts.Width / 2, my + ps.Height / 2 - 6, shadow);
+        tempRects.Add(new RectangleF(mx - ts.Width / 2, my + ps.Height / 2 - 6, ts.Width, ts.Height));   // click: °C <-> °F
         var ss = g.MeasureString(sub, fSmall); Text(g, sub, fSmall, dim, mx - ss.Width / 2, r.Bottom - 8, shadow);
     }
 
@@ -373,6 +528,53 @@ sealed class HudForm : Form
         finally { SelectObject(memDc, old); DeleteObject(hBmp); DeleteDC(memDc); ReleaseDC(IntPtr.Zero, screenDc); }
     }
 
+
+    // ---------------- group mode (with AI Quota HUD) ----------------
+    bool link, sameStyle = true, applyingGroup, groupRead;
+    void PublishGroup()
+    {
+        if (applyingGroup || !groupRead) return;             // startup saves wait until the other widget's state has been read
+        var kv = new Dictionary<string, string> { ["link"] = link ? "1" : "0", ["same"] = sameStyle ? "1" : "0" };
+        if (link) kv["size"] = ((int)Math.Round(size * 100)).ToString();
+        if (link && sameStyle) { kv["frame"] = frame.ToString(); kv["theme"] = Themes[theme].name; kv["bg"] = bg.ToString(); kv["alpha"] = panelAlpha.ToString(); kv["opacity"] = opacity.ToString(); kv["font"] = fontKey; }
+        Group.Write("hud", kv);
+    }
+    void ApplyGroup()
+    {
+        groupRead = true;
+        var kv = Group.ReadNew("hud");
+        if (kv == null) return;
+        string V(string k) => kv.TryGetValue(k, out var v) ? v : null;
+        applyingGroup = true;
+        try
+        {
+            link = V("link") == "1"; sameStyle = V("same") != "0";
+            if (link && int.TryParse(V("size"), out var sz) && Math.Abs(sz / 100f - size) > 0.004f) { size = Math.Clamp(sz / 100f, 0.6f, 2.2f); BuildFonts(); ApplySize(); }
+            if (link && sameStyle)
+            {
+                int ti = Array.FindIndex(Themes, x => x.name == V("theme")); if (ti >= 0) theme = ti;
+                if (int.TryParse(V("frame"), out var fr)) frame = Math.Clamp(fr, 0, 2);
+                if (int.TryParse(V("bg"), out var b)) bg = Math.Clamp(b, 0, Backgrounds.Length - 1);
+                if (int.TryParse(V("alpha"), out var a)) panelAlpha = Math.Clamp(a, 0, 255);
+                if (byte.TryParse(V("opacity"), out var o)) opacity = Math.Max((byte)40, o);
+                if (V("font") is string f && f != fontKey) { fontKey = f; BuildFonts(); }
+            }
+            SaveSettings(); Render();
+        }
+        finally { applyingGroup = false; }
+    }
+    ToolStripMenuItem GroupMenu()
+    {
+        var mg = new ToolStripMenuItem("Group with AI Quota HUD");
+        mg.DropDownItems.Add(Check("Linked: move + resize together", () => link, v => { link = v; if (v) PublishGroup(); }));
+        mg.DropDownItems.Add(Check("Same colours + font", () => sameStyle, v => sameStyle = v));
+        mg.DropDownItems.Add(new ToolStripSeparator());
+        mg.DropDownItems.Add(new ToolStripMenuItem("Split apart", null, (_, _) => { link = false; SaveSettings(); RefreshChecks(); }));
+        mg.DropDownItems.Add(new ToolStripMenuItem("(drag the two close together: they snap edge to edge)") { Enabled = false });
+        mg.DropDownOpening += (_, _) => RefreshChecks();
+        return mg;
+    }
+
     // ---------------- settings ----------------
     void LoadSettings()
     {
@@ -385,7 +587,8 @@ sealed class HudForm : Form
             TopMost = I("top", 0) == 1; opacity = (byte)Math.Clamp(I("opacity", 255), 40, 255);
             theme = Math.Clamp(I("theme", 0), 0, Themes.Length - 1); bg = Math.Clamp(I("bg", 0), 0, Backgrounds.Length - 1); panelAlpha = Math.Clamp(I("alpha", 210), 0, 255);
             size = Math.Clamp(I("size", 100), 60, 220) / 100f; pinDesktop = I("pin", 0) == 1; fahrenheit = I("f", 0) == 1;
-            showThreads = I("threads", 1) == 1; showGraph = I("graph", 1) == 1; showClock = I("clock", 1) == 1; corners = I("corners", 1) == 1;
+            showThreads = I("threads", 1) == 1; showGraph = I("graph", 1) == 1; showClock = I("clock", 1) == 1; corners = I("corners", 1) == 1; showNet = I("net", 1) == 1; frame = Math.Clamp(I("frame", 0), 0, 2); allDisks = I("disks", 1) == 1; diskSel = kv.TryGetValue("disk", out var ds) ? ds : ""; diskUsedMode = I("diskused", 0) == 1; sysPower = I("sys", 0) == 1; link = I("link", 0) == 1; sameStyle = I("same", 1) == 1;
+            fontKey = kv.TryGetValue("font", out var fk) ? fk : "bahn";
         }
         catch { }
     }
@@ -394,9 +597,10 @@ sealed class HudForm : Form
     {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(cfgPath));
+            Directory.CreateDirectory(Path.GetDirectoryName(cfgPath)); savedLoc = Location;
             File.WriteAllLines(cfgPath, new[] { $"x={Left}", $"y={Top}", $"top={(TopMost ? 1 : 0)}", $"opacity={opacity}", $"theme={theme}", $"bg={bg}", $"alpha={panelAlpha}",
-                $"size={(int)Math.Round(size * 100)}", $"f={(fahrenheit ? 1 : 0)}", $"threads={(showThreads ? 1 : 0)}", $"graph={(showGraph ? 1 : 0)}", $"clock={(showClock ? 1 : 0)}", $"corners={(corners ? 1 : 0)}", $"pin={(pinDesktop ? 1 : 0)}" });
+                $"link={(link ? 1 : 0)}", $"same={(sameStyle ? 1 : 0)}", $"size={(int)Math.Round(size * 100)}", $"f={(fahrenheit ? 1 : 0)}", $"threads={(showThreads ? 1 : 0)}", $"graph={(showGraph ? 1 : 0)}", $"clock={(showClock ? 1 : 0)}", $"corners={(corners ? 1 : 0)}", $"pin={(pinDesktop ? 1 : 0)}", $"font={fontKey}", $"net={(showNet ? 1 : 0)}", $"frame={frame}", $"disks={(allDisks ? 1 : 0)}", $"disk={diskSel}", $"diskused={(diskUsedMode ? 1 : 0)}", $"sys={(sysPower ? 1 : 0)}" });
+            PublishGroup();
         }
         catch { }
     }
